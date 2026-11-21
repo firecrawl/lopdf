@@ -1,13 +1,22 @@
-use super::{Dictionary, Object, ObjectId, Reader, Stream, StringFormat};
+use super::{Dictionary, Object, ObjectId, Stream, StringFormat};
+use crate::Error;
 use crate::content::*;
 use crate::error;
 use crate::xref::*;
-use crate::Error;
 use std::collections::HashSet;
 use std::str::{self, FromStr};
 
+/// Parse-time resolver for the one indirect reference the object
+/// grammar itself must chase: a stream dictionary whose /Length is an
+/// indirect reference. Implemented by the load-time `Reader` (raw
+/// xref walk over the file bytes) and by the lazy object store
+/// (cell-cached resolve), so one parser serves both.
+pub trait ObjectResolver {
+    fn resolve_reference(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> crate::Result<Object>;
+}
+
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take, take_while, take_while1, take_while_m_n};
+use nom::bytes::complete::{tag, take, take_while, take_while_m_n, take_while1};
 use nom::character::complete::multispace1;
 use nom::character::complete::{digit0, digit1, one_of};
 use nom::character::complete::{space0, space1};
@@ -338,12 +347,16 @@ pub(crate) fn dict_dup(input: ParserInput) -> NomResult<Dictionary> {
     .parse(input)
 }
 
-fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
+fn stream<'a>(
+    input: ParserInput<'a>, resolver: &dyn ObjectResolver, already_seen: &mut HashSet<ObjectId>,
+) -> NomResult<'a, Object> {
     let (i, dict) = terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(input)?;
 
     if let Ok(length) = dict.get(b"Length").and_then(|value| {
         if let Ok(id) = value.as_reference() {
-            reader.get_object(id, already_seen).and_then(|value| value.as_i64())
+            resolver
+                .resolve_reference(id, already_seen)
+                .and_then(|value| value.as_i64())
         } else {
             value.as_i64()
         }
@@ -376,20 +389,32 @@ fn reference(input: ParserInput) -> NomResult<Object> {
 }
 
 fn _direct_objects(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
-    move |input| {
-        alt((
-            null,
-            boolean,
-            reference,
-            map(real, Object::Real),
-            map(integer, Object::Integer),
-            map(name, Object::Name),
-            map(literal_string, Object::string_literal),
+    // Every alternative opens with its own byte class and fails softly on
+    // any other first byte, so only the alternatives that can start here
+    // are tried, in their usual order.
+    move |input| match input.first() {
+        Some(b'n') => null(input),
+        Some(b't' | b'f') => boolean(input),
+        Some(b'+' | b'-' | b'.' | b'0'..=b'9') => {
+            alt((reference, map(real, Object::Real), map(integer, Object::Integer))).parse(input)
+        }
+        Some(b'/') => map(name, Object::Name).parse(input),
+        Some(b'(') => map(literal_string, Object::string_literal).parse(input),
+        // Growth slack is released: document objects outlive the parse.
+        Some(b'<') => alt((
             hexadecimal_string,
-            map(array(depth), Object::Array),
-            map(_dictionary(depth), Object::Dictionary),
+            map(_dictionary(depth), |mut dict| {
+                dict.shrink_to_fit();
+                Object::Dictionary(dict)
+            }),
         ))
-        .parse(input)
+        .parse(input),
+        Some(b'[') => map(array(depth), |mut items| {
+            items.shrink_to_fit();
+            Object::Array(items)
+        })
+        .parse(input),
+        _ => Err(nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Alt))),
     }
 }
 
@@ -406,10 +431,12 @@ pub fn direct_object(input: ParserInput) -> Option<Object> {
     strip_nom(_direct_object(crate::reader::MAX_NESTING_DEPTH)(input))
 }
 
-fn object<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
+fn object<'a>(
+    input: ParserInput<'a>, resolver: &dyn ObjectResolver, already_seen: &mut HashSet<ObjectId>,
+) -> NomResult<'a, Object> {
     terminated(
         alt((
-            |input| stream(input, reader, already_seen),
+            |input| stream(input, resolver, already_seen),
             _direct_objects(crate::reader::MAX_NESTING_DEPTH),
         )),
         space,
@@ -418,18 +445,18 @@ fn object<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
 }
 
 pub fn indirect_object(
-    input: ParserInput, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
+    input: ParserInput, offset: usize, expected_id: Option<ObjectId>, resolver: &dyn ObjectResolver,
     already_seen: &mut HashSet<ObjectId>,
 ) -> crate::Result<(ObjectId, Object)> {
-    let (id, mut object) = _indirect_object(input.take_from(offset), offset, expected_id, reader, already_seen)?;
+    let (id, mut object) = _indirect_object(input.take_from(offset), offset, expected_id, resolver, already_seen)?;
 
     offset_stream(&mut object, offset);
 
     Ok((id, object))
 }
 
-fn _indirect_object<'a>(
-    input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
+pub(crate) fn _indirect_object<'a>(
+    input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, resolver: &dyn ObjectResolver,
     already_seen: &mut HashSet<ObjectId>,
 ) -> crate::Result<(ObjectId, Object)> {
     let (i, (_, object_id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
@@ -443,7 +470,7 @@ fn _indirect_object<'a>(
 
     let object_offset = input.len() - i.len();
     let (_, mut object) = terminated(
-        |i: ParserInput<'a>| object(i, reader, already_seen),
+        |i: ParserInput<'a>| object(i, resolver, already_seen),
         (space, opt(tag(&b"endobj"[..])), space),
     )
     .parse(i)
@@ -493,8 +520,20 @@ pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
 }
 
 /// Decode CrossReferenceTable
-fn xref(input: ParserInput) -> NomResult<Xref> {
-    let xref_eol = map(alt((tag(&b" \r"[..]), tag(&b" \n"[..]), tag(&b"\r\n"[..]))), |_| ());
+fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
+    // ISO 32000-1 s7.5.4 requires every entry to be exactly 20 bytes, ending in one of the
+    // 2-byte terminators SP CR, SP LF or CR LF. Many generators instead emit 19-byte entries
+    // ending in a bare LF, which qpdf, pikepdf, PDFium and PDF.js all accept. Accept those
+    // too when parsing leniently, but keep the conforming 2-byte forms first in the `alt` so
+    // that a bare CR never matches the CR of a conforming CR LF and strands its LF.
+    let xref_eol = move |i| {
+        let conforming = alt((tag(&b" \r"[..]), tag(&b" \n"[..]), tag(&b"\r\n"[..])));
+        if strict {
+            map(conforming, |_| ()).parse(i)
+        } else {
+            map(alt((conforming, tag(&b"\n"[..]), tag(&b"\r"[..]))), |_| ()).parse(i)
+        }
+    };
     let xref_entry = pair(
         separated_pair(unsigned_int, tag(&b" "[..]), unsigned_int::<u32>),
         delimited(tag(&b" "[..]), map(one_of("nf"), |k| k == 'n'), xref_eol),
@@ -530,8 +569,10 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
     delimited(pair(tag(&b"trailer"[..]), space), dictionary, space).parse(input)
 }
 
-pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
-    let xref_trailer = map(pair(xref, trailer), |(mut xref, trailer)| {
+pub fn xref_and_trailer(
+    input: ParserInput, resolver: &dyn ObjectResolver, strict: bool,
+) -> crate::Result<(Xref, Dictionary)> {
+    let xref_trailer = map(pair(|i| xref(i, strict), trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
             .and_then(Object::as_i64)
@@ -541,7 +582,7 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
     alt((
         xref_trailer,
         (|input| {
-            _indirect_object(input, 0, None, reader, &mut HashSet::new())
+            _indirect_object(input, 0, None, resolver, &mut HashSet::new())
                 .map(|(_, obj)| {
                     let res = match obj {
                         Object::Stream(stream) => decode_xref_stream(stream),
@@ -579,34 +620,43 @@ fn trim_spaces<'a, O>(
 
 // The following code create parser to parse content stream.
 
-fn content_space(input: ParserInput) -> NomResult<()> {
+pub(crate) fn content_space(input: ParserInput) -> NomResult<()> {
     map(take_while(|c| b" \t\r\n".contains(&c)), |_| ()).parse(input)
 }
 
-fn operator(input: ParserInput) -> NomResult<String> {
+/// The operator token as a borrowed slice of the input; the single home
+/// of the operator character class.
+pub(crate) fn operator_bytes(input: ParserInput<'_>) -> NomResult<'_, &str> {
     map_res(
         take_while1(|c: u8| c.is_ascii_alphabetic() || b"*'\"".contains(&c)),
-        |op: ParserInput| str::from_utf8(op).map(Into::into),
+        str::from_utf8,
     )
     .parse(input)
 }
 
-fn operand(input: ParserInput) -> NomResult<Object> {
-    terminated(
-        alt((
-            null,
-            boolean,
-            map(real, Object::Real),
-            map(integer, Object::Integer),
-            map(name, Object::Name),
-            map(literal_string, Object::string_literal),
-            hexadecimal_string,
-            map(array(crate::reader::MAX_NESTING_DEPTH), Object::Array),
-            map(dictionary, Object::Dictionary),
-        )),
-        content_space,
-    )
-    .parse(input)
+fn operator(input: ParserInput) -> NomResult<String> {
+    map(operator_bytes, Into::into).parse(input)
+}
+
+pub(crate) fn operand(input: ParserInput) -> NomResult<Object> {
+    // Every operand alternative opens with its own byte class and fails
+    // softly on any other first byte, so only the alternatives that can
+    // start here are tried, in their usual order. An operator therefore
+    // ends the operand list without running every alternative.
+    let (rest, object) = match input.first() {
+        Some(b'n') => null(input),
+        Some(b't' | b'f') => boolean(input),
+        Some(b'+' | b'-' | b'.' | b'0'..=b'9') => {
+            alt((map(real, Object::Real), map(integer, Object::Integer))).parse(input)
+        }
+        Some(b'/') => map(name, Object::Name).parse(input),
+        Some(b'(') => map(literal_string, Object::string_literal).parse(input),
+        Some(b'<') => alt((hexadecimal_string, map(dictionary, Object::Dictionary))).parse(input),
+        Some(b'[') => map(array(crate::reader::MAX_NESTING_DEPTH), Object::Array).parse(input),
+        _ => Err(nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Alt))),
+    }?;
+    let (rest, ()) = content_space(rest)?;
+    Ok((rest, object))
 }
 
 fn operation(input: ParserInput) -> NomResult<Operation> {
@@ -620,7 +670,7 @@ fn operation(input: ParserInput) -> NomResult<Operation> {
     .parse(input)
 }
 
-fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, String)> {
+pub(crate) fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, String)> {
     preceded(pair(tag(&b"BI"[..]), content_space), cut(inline_image_impl)).parse(input)
 }
 
@@ -870,7 +920,7 @@ startxref
 153804\x20
 %%EOF
 ";
-        match xref(test_span(input)) {
+        match xref(test_span(input), false) {
             Ok((_, re)) => assert_eq!(re.entries.len(), 15),
             Err(err) => panic!("unexpected {:?}", err),
         }
@@ -983,7 +1033,7 @@ EI";
     fn xref_trailing_space_after_keyword() {
         // Some PDF generators emit "xref \n" with a trailing space.
         let input = b"xref \n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\nstartxref\n175\n%%EOF\n";
-        match xref(test_span(input)) {
+        match xref(test_span(input), false) {
             Ok((_, re)) => assert_eq!(re.entries.len(), 2),
             Err(err) => panic!("xref with trailing space should parse: {:?}", err),
         }

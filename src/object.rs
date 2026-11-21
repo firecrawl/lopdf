@@ -5,6 +5,7 @@ use crate::error::DecompressError;
 use crate::{Document, Error, Result};
 use indexmap::IndexMap;
 use log::warn;
+use std::borrow::Cow;
 use std::cmp::max;
 use std::collections::HashSet;
 use std::fmt;
@@ -347,6 +348,10 @@ impl Dictionary {
 
     pub fn has(&self, key: &[u8]) -> bool {
         self.0.contains_key(key)
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.0.shrink_to_fit();
     }
 
     pub fn get(&self, key: &[u8]) -> Result<&Object> {
@@ -792,11 +797,17 @@ impl Stream {
     }
 
     pub fn decompressed_content(&self) -> Result<Vec<u8>> {
+        self.decompressed_content_cow().map(Cow::into_owned)
+    }
+
+    /// Decoded content, borrowing the stored bytes when the stream has no
+    /// /Filter instead of copying them.
+    pub fn decompressed_content_cow(&self) -> Result<Cow<'_, [u8]>> {
         let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
         let filters = match self.filters() {
             Ok(f) => f,
             // No /Filter key means the stream is uncompressed
-            Err(_) => return Ok(self.content.clone()),
+            Err(_) => return Ok(Cow::Borrowed(&self.content)),
         };
 
         let mut input = self.content.as_slice();
@@ -812,7 +823,7 @@ impl Stream {
             };
             input = &output;
         }
-        Ok(output)
+        Ok(Cow::Owned(output))
     }
 
     fn decompress_lzw(input: &[u8], params: Option<&Dictionary>) -> Result<Vec<u8>> {

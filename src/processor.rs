@@ -10,7 +10,10 @@ impl Document {
         if let Ok(info) = self.trailer.get_mut(b"Info") {
             if let Some(dict) = match info {
                 Object::Dictionary(dict) => Some(dict),
-                Object::Reference(id) => self.objects.get_mut(id).and_then(|o| o.as_dict_mut().ok()),
+                Object::Reference(id) => {
+                    let id = *id;
+                    self.get_object_mut(id).and_then(Object::as_dict_mut).ok()
+                }
                 _ => None,
             } {
                 dict.set("Producer", Object::string_literal(producer));
@@ -20,6 +23,7 @@ impl Document {
 
     /// Compress PDF stream objects.
     pub fn compress(&mut self) {
+        self.materialize_all();
         for object in self.objects.values_mut() {
             if let Object::Stream(stream) = object {
                 if stream.allows_compression {
@@ -32,6 +36,7 @@ impl Document {
 
     /// Decompress PDF stream objects.
     pub fn decompress(&mut self) {
+        self.materialize_all();
         for object in self.objects.values_mut() {
             if let Object::Stream(stream) = object {
                 let _ = stream.decompress();
@@ -49,7 +54,7 @@ impl Document {
                     .and_then(|dict| dict.get(b"Parent"))
                     .and_then(Object::as_reference);
                 while let Ok(page_tree_id) = page_tree_ref {
-                    if let Some(page_tree) = self.objects.get_mut(&page_tree_id).and_then(|pt| pt.as_dict_mut().ok()) {
+                    if let Some(page_tree) = self.get_object_mut(page_tree_id).and_then(Object::as_dict_mut).ok() {
                         if let Ok(count) = page_tree.get(b"Count").and_then(Object::as_i64) {
                             page_tree.set("Count", count - 1);
                         }
@@ -106,11 +111,12 @@ impl Document {
             _ => {}
         };
         self.traverse_objects(action);
-        self.objects.remove(&id)
+        self.remove_object_everywhere(id)
     }
 
     /// Delete zero length stream objects.
     pub fn delete_zero_length_streams(&mut self) -> Vec<ObjectId> {
+        self.materialize_all();
         let mut ids = vec![];
         for id in self.objects.keys() {
             if self
@@ -163,6 +169,7 @@ impl Document {
     /// Renumber objects with a custom starting id, this is very useful in case of multiple
     /// document object insertions in a single main document
     pub fn renumber_objects_with(&mut self, starting_id: u32) {
+        self.materialize_all();
         let mut replace = BTreeMap::new();
         let mut new_id = starting_id;
         let mut i = 0;
@@ -262,7 +269,7 @@ impl Document {
     }
 
     pub fn change_content_stream(&mut self, stream_id: ObjectId, content: Vec<u8>) {
-        if let Some(Object::Stream(stream)) = self.objects.get_mut(&stream_id) {
+        if let Ok(Object::Stream(stream)) = self.get_object_mut(stream_id) {
             stream.set_plain_content(content);
             // Ignore any compression error.
             let _ = stream.compress();

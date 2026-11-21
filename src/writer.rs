@@ -24,6 +24,7 @@ impl Document {
 
     /// Save PDF with custom options
     pub fn save_with_options<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
+        self.materialize_all();
         if options.use_object_streams {
             self.save_with_object_streams(target, options)
         } else {
@@ -42,6 +43,7 @@ impl Document {
     }
 
     fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        self.materialize_all();
         let mut target = CountingWrite {
             inner: target,
             bytes_written: 0,
@@ -278,6 +280,7 @@ impl IncrementalDocument {
     }
 
     fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        self.new_document.materialize_all();
         let mut target = CountingWrite {
             inner: target,
             bytes_written: 0,

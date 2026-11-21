@@ -1,4 +1,4 @@
-use log::{error, warn};
+use log::warn;
 use std::cmp;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
@@ -7,10 +7,8 @@ use std::fs::File;
 #[cfg(not(feature = "async"))]
 use std::io::Read;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
-#[cfg(feature = "rayon")]
-use rayon::prelude::*;
 #[cfg(feature = "async")]
 use tokio::fs::File;
 #[cfg(feature = "async")]
@@ -21,6 +19,7 @@ use tokio::pin;
 use crate::common_data_structures;
 use crate::encryption::{self, EncryptionState};
 use crate::error::{ParseError, XrefError};
+use crate::lazy::LazyStore;
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
@@ -95,16 +94,48 @@ impl Document {
     }
 
     /// Load a PDF document from a memory slice with the given options.
+    /// The slice is copied once; callers that own the bytes use
+    /// [`Document::load_mem_owned`] and pay no copy at all.
     pub fn load_mem_with_options(buffer: &[u8], options: LoadOptions) -> Result<Document> {
+        Self::load_mem_owned_with_options(buffer.to_vec(), options)
+    }
+
+    /// Load a PDF document from an owned byte vector without copying:
+    /// the lazy object store shares these exact bytes for the
+    /// document's life.
+    pub fn load_mem_owned(buffer: Vec<u8>) -> Result<Document> {
+        Self::load_mem_owned_with_options(buffer, LoadOptions::default())
+    }
+
+    /// Owned-buffer form of [`Document::load_mem_with_options`].
+    pub fn load_mem_owned_with_options(buffer: Vec<u8>, options: LoadOptions) -> Result<Document> {
+        Self::load_mem_shared_with_options(Arc::new(buffer), options)
+    }
+
+    /// Shared-buffer load: the lazy object store keeps this exact
+    /// allocation for the document's life, so a caller holding the
+    /// bytes for retries (decryption, container repair) shares one
+    /// copy with the document instead of duplicating it.
+    pub fn load_mem_shared_with_options(buffer: Arc<Vec<u8>>, options: LoadOptions) -> Result<Document> {
+        // Junk before the header desynchronizes xref offsets from the
+        // stored bytes; a prefixed buffer is re-based onto its own
+        // trimmed allocation (rare — the header normally starts the
+        // file).
+        let offset = buffer.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+        let shared = if offset == 0 {
+            buffer
+        } else {
+            Arc::new(buffer[offset..].to_vec())
+        };
         Reader {
-            buffer,
+            buffer: &shared,
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
             password: options.password,
             strict: options.strict,
         }
-        .read(options.filter)
+        .read_sharing(options.filter, &shared)
     }
 
     /// Load a PDF document from a memory slice with a password for encrypted PDFs.
@@ -235,16 +266,48 @@ impl Document {
     }
 
     /// Load a PDF document from a memory slice with the given options.
+    /// The slice is copied once; callers that own the bytes use
+    /// [`Document::load_mem_owned`] and pay no copy at all.
     pub fn load_mem_with_options(buffer: &[u8], options: LoadOptions) -> Result<Document> {
+        Self::load_mem_owned_with_options(buffer.to_vec(), options)
+    }
+
+    /// Load a PDF document from an owned byte vector without copying:
+    /// the lazy object store shares these exact bytes for the
+    /// document's life.
+    pub fn load_mem_owned(buffer: Vec<u8>) -> Result<Document> {
+        Self::load_mem_owned_with_options(buffer, LoadOptions::default())
+    }
+
+    /// Owned-buffer form of [`Document::load_mem_with_options`].
+    pub fn load_mem_owned_with_options(buffer: Vec<u8>, options: LoadOptions) -> Result<Document> {
+        Self::load_mem_shared_with_options(Arc::new(buffer), options)
+    }
+
+    /// Shared-buffer load: the lazy object store keeps this exact
+    /// allocation for the document's life, so a caller holding the
+    /// bytes for retries (decryption, container repair) shares one
+    /// copy with the document instead of duplicating it.
+    pub fn load_mem_shared_with_options(buffer: Arc<Vec<u8>>, options: LoadOptions) -> Result<Document> {
+        // Junk before the header desynchronizes xref offsets from the
+        // stored bytes; a prefixed buffer is re-based onto its own
+        // trimmed allocation (rare — the header normally starts the
+        // file).
+        let offset = buffer.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+        let shared = if offset == 0 {
+            buffer
+        } else {
+            Arc::new(buffer[offset..].to_vec())
+        };
         Reader {
-            buffer,
+            buffer: &shared,
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
             password: options.password,
             strict: options.strict,
         }
-        .read(options.filter)
+        .read_sharing(options.filter, &shared)
     }
 
     /// Load PDF metadata (title and page count) without loading the entire document.
@@ -441,6 +504,12 @@ impl TryInto<IncrementalDocument> for &[u8] {
     }
 }
 
+impl parser::ObjectResolver for Reader<'_> {
+    fn resolve_reference(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
+        self.get_object(id, already_seen)
+    }
+}
+
 pub struct Reader<'a> {
     pub buffer: &'a [u8],
     pub document: Document,
@@ -548,7 +617,7 @@ impl Reader<'_> {
             return Err(Error::Xref(XrefError::Start));
         }
 
-        let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self)?;
+        let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self, self.strict)?;
 
         let mut already_seen = HashSet::new();
         let mut prev_xref_start = trailer.remove(b"Prev");
@@ -561,7 +630,8 @@ impl Reader<'_> {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
 
-            let (prev_xref, prev_trailer) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+            let (prev_xref, prev_trailer) =
+                parser::xref_and_trailer(&self.buffer[prev as usize..], &self, self.strict)?;
             xref.merge(prev_xref);
 
             let prev_xref_stream_start = trailer.remove(b"XRefStm");
@@ -570,7 +640,7 @@ impl Reader<'_> {
                     return Err(Error::Xref(XrefError::StreamStart));
                 }
 
-                let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+                let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self, self.strict)?;
                 xref.merge(prev_xref);
             }
 
@@ -735,8 +805,23 @@ impl Reader<'_> {
         }
     }
 
-    /// Read whole document.
-    pub fn read(mut self, filter_func: Option<FilterFunc>) -> Result<Document> {
+    /// Read whole document, copying the buffer into the lazy store.
+    pub fn read(self, filter_func: Option<FilterFunc>) -> Result<Document> {
+        let shared = Arc::new(self.buffer.to_vec());
+        Reader {
+            buffer: &shared,
+            document: self.document,
+            encryption_state: self.encryption_state,
+            raw_objects: self.raw_objects,
+            password: self.password,
+            strict: self.strict,
+        }
+        .read_sharing(filter_func, &shared)
+    }
+
+    /// Read whole document; the lazy store shares `shared`, which MUST
+    /// be the same bytes this reader borrows (offsets index into it).
+    fn read_sharing(mut self, filter_func: Option<FilterFunc>, shared: &Arc<Vec<u8>>) -> Result<Document> {
         let offset = self.buffer.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
         self.buffer = &self.buffer[offset..];
 
@@ -760,7 +845,7 @@ impl Reader<'_> {
         }
         self.document.xref_start = xref_start;
 
-        let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self)?;
+        let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self, self.strict)?;
 
         // Read previous Xrefs of linearized or incremental updated document.
         let mut already_seen = HashSet::new();
@@ -774,7 +859,8 @@ impl Reader<'_> {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
 
-            let (prev_xref, prev_trailer) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+            let (prev_xref, prev_trailer) =
+                parser::xref_and_trailer(&self.buffer[prev as usize..], &self, self.strict)?;
             xref.merge(prev_xref);
 
             // Read xref stream in hybrid-reference file
@@ -784,7 +870,7 @@ impl Reader<'_> {
                     return Err(Error::Xref(XrefError::StreamStart));
                 }
 
-                let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+                let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self, self.strict)?;
                 xref.merge(prev_xref);
             }
 
@@ -804,112 +890,42 @@ impl Reader<'_> {
         self.document.trailer = trailer;
         self.document.reference_table = xref;
 
-        // Check if encrypted
-        let is_encrypted = self.document.trailer.get(b"Encrypt").is_ok();
-
-        if is_encrypted {
-            // For encrypted PDFs, use a special loading strategy
-            self.load_encrypted_document(filter_func)?;
+        // Every document loads lazily: nothing beyond the xref chain is
+        // parsed here; objects materialize on first dereference through the
+        // lazy store. A junk prefix would desynchronize xref offsets from the
+        // shared bytes; the owning loaders trim it up front, and a remaining
+        // prefix means this reader was built on raw bytes, where the trimmed
+        // copy is taken instead.
+        let store_bytes = if self.buffer.len() == shared.len() {
+            Arc::clone(shared)
         } else {
-            // For non-encrypted PDFs, use the normal loading
-            self.load_objects_raw(filter_func)?;
+            Arc::new(self.buffer.to_vec())
+        };
+        let store = LazyStore::build(store_bytes, &self.document.reference_table, filter_func);
+
+        if self.document.trailer.get(b"Encrypt").is_ok() {
+            // An encrypted document decrypts each object as it
+            // materializes. Without a usable password nothing beyond the
+            // encryption dictionary is readable, and no store is attached.
+            self.parse_encryption_dictionary()?;
+            if self.authenticate_and_setup_encryption(false)?.is_none() {
+                return Ok(self.document);
+            }
+            if let Some(state) = self.encryption_state.clone() {
+                let mut store = store.decrypting(state.clone());
+                if let Ok(encrypt_ref) = self.document.trailer.get(b"Encrypt").and_then(Object::as_reference) {
+                    store.purge(encrypt_ref.0);
+                    self.document.objects.remove(&encrypt_ref);
+                }
+                self.document.lazy = Some(store);
+                self.document.encryption_state = Some(state);
+                self.document.trailer.remove(b"Encrypt");
+            }
+        } else {
+            self.document.lazy = Some(store);
         }
 
         Ok(self.document)
-    }
-
-    fn load_encrypted_document(&mut self, _filter_func: Option<FilterFunc>) -> Result<()> {
-        // First, extract all raw object bytes without parsing
-        let entries: Vec<_> = self
-            .document
-            .reference_table
-            .entries
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-
-        let mut object_streams = Vec::new();
-
-        for (obj_num, entry) in entries {
-            match entry {
-                XrefEntry::Normal { offset, .. } => {
-                    if let Ok((obj_id, raw_bytes)) = self.extract_raw_object(offset as usize) {
-                        self.raw_objects.insert(obj_id, raw_bytes);
-                    }
-                }
-                XrefEntry::Compressed { container, index } => {
-                    // Store compressed object info for later processing
-                    object_streams.push((obj_num, container, index));
-                }
-                XrefEntry::Free | XrefEntry::UnusableFree => {
-                    // Skip free entries
-                }
-            }
-        }
-
-        self.parse_encryption_dictionary()?;
-
-        if self.authenticate_and_setup_encryption(false)?.is_none() {
-            return Ok(());
-        }
-
-        if let Some(ref state) = self.encryption_state {
-            let encrypt_ref = self
-                .document
-                .trailer
-                .get(b"Encrypt")
-                .ok()
-                .and_then(|o| o.as_reference().ok());
-
-            for (obj_id, raw_bytes) in &self.raw_objects {
-                if let Some(enc_ref) = encrypt_ref {
-                    if *obj_id == enc_ref {
-                        continue;
-                    }
-                }
-
-                if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
-                    let _ = encryption::decrypt_object(state, *obj_id, &mut obj);
-                    self.document.objects.insert(id, obj);
-                }
-            }
-
-            let mut streams_to_process: std::collections::HashMap<u32, Vec<(u32, u16)>> =
-                std::collections::HashMap::new();
-            for (obj_num, container_id, index) in object_streams {
-                streams_to_process
-                    .entry(container_id)
-                    .or_default()
-                    .push((obj_num, index));
-            }
-
-            for (container_id, objects_in_stream) in streams_to_process {
-                if let Some(container_obj) = self.document.objects.get_mut(&(container_id, 0)) {
-                    if let Ok(stream) = container_obj.as_stream_mut() {
-                        match ObjectStream::new(stream) {
-                            Ok(object_stream) => {
-                                for (obj_num, _index) in objects_in_stream {
-                                    let obj_id = (obj_num, 0);
-                                    if let Some(obj) = object_stream.objects.get(&obj_id) {
-                                        self.document.objects.insert(obj_id, obj.clone());
-                                    }
-                                }
-                            }
-                            Err(_e) => {}
-                        }
-                    }
-                }
-            }
-
-            self.document.encryption_state = Some(state.clone());
-
-            if let Some(enc_ref) = encrypt_ref {
-                self.document.objects.remove(&enc_ref);
-            }
-            self.document.trailer.remove(b"Encrypt");
-        }
-
-        Ok(())
     }
 
     fn parse_raw_object(&self, raw_bytes: &[u8]) -> Result<(ObjectId, Object)> {
@@ -917,160 +933,6 @@ impl Reader<'_> {
         parser::indirect_object(raw_bytes, 0, None, self, &mut HashSet::new())
     }
 
-    fn load_objects_raw(&mut self, filter_func: Option<FilterFunc>) -> Result<()> {
-        let is_encrypted = self.document.trailer.get(b"Encrypt").is_ok();
-        let zero_length_streams = Mutex::new(vec![]);
-        let object_streams = Mutex::new(vec![]);
-
-        // Build a map of which container each compressed object belongs to
-        // according to the xref. This prevents stale ObjStm copies (e.g., from
-        // linearization first-page sections) from overriding the correct version.
-        let compressed_obj_containers: BTreeMap<u32, u32> = self
-            .document
-            .reference_table
-            .entries
-            .iter()
-            .filter_map(|(&id, entry)| {
-                if let XrefEntry::Compressed { container, .. } = entry {
-                    Some((id, *container))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let entries_filter_map = |(_, entry): (&_, &_)| {
-            if let XrefEntry::Normal { offset, .. } = *entry {
-                // read_object now handles decryption internally
-                let result = self.read_object(offset as usize, None, &mut HashSet::new());
-                let (object_id, mut object) = match result {
-                    Ok(obj) => obj,
-                    Err(e) => {
-                        // Log error but continue
-                        if is_encrypted {
-                            // Expected for some encrypted objects - but log which ones
-                            warn!("Skipping encrypted object at offset {}: {:?}", offset, e);
-                        } else {
-                            error!("Object load error at offset {}: {e:?}", offset);
-                        }
-                        return None;
-                    }
-                };
-                if let Some(filter_func) = filter_func {
-                    filter_func(object_id, &mut object)?;
-                }
-
-                if let Ok(ref mut stream) = object.as_stream_mut() {
-                    if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream = ObjectStream::new(stream).ok()?;
-                        let container_id = object_id.0;
-                        let mut object_streams = object_streams.lock().unwrap();
-                        if let Some(filter_func) = filter_func {
-                            let objects: BTreeMap<(u32, u16), Object> = obj_stream
-                                .objects
-                                .into_iter()
-                                .filter(|((obj_num, _), _)| {
-                                    compressed_obj_containers
-                                        .get(obj_num)
-                                        .is_none_or(|&c| c == container_id)
-                                })
-                                .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
-                                .collect();
-                            object_streams.extend(objects);
-                        } else {
-                            object_streams.extend(obj_stream.objects.into_iter().filter(|((obj_num, _), _)| {
-                                compressed_obj_containers
-                                    .get(obj_num)
-                                    .is_none_or(|&c| c == container_id)
-                            }));
-                        }
-                    } else if stream.content.is_empty() {
-                        let mut zero_length_streams = zero_length_streams.lock().unwrap();
-                        zero_length_streams.push(object_id);
-                    }
-                }
-
-                Some((object_id, object))
-            } else {
-                None
-            }
-        };
-
-        #[cfg(feature = "rayon")]
-        {
-            self.document.objects = self
-                .document
-                .reference_table
-                .entries
-                .par_iter()
-                .filter_map(entries_filter_map)
-                .collect();
-        }
-        #[cfg(not(feature = "rayon"))]
-        {
-            self.document.objects = self
-                .document
-                .reference_table
-                .entries
-                .iter()
-                .filter_map(entries_filter_map)
-                .collect();
-        }
-
-        // Only add entries, but never replace entries
-        for (id, entry) in object_streams.into_inner().unwrap() {
-            self.document.objects.entry(id).or_insert(entry);
-        }
-
-        for object_id in zero_length_streams.into_inner().unwrap() {
-            let _ = self.read_stream_content(object_id);
-        }
-
-        Ok(())
-    }
-
-    fn read_stream_content(&mut self, object_id: ObjectId) -> Result<()> {
-        let length = self.get_stream_length(object_id)?;
-        let stream = self
-            .document
-            .get_object_mut(object_id)
-            .and_then(Object::as_stream_mut)?;
-        let start = stream
-            .start_position
-            .ok_or(Error::InvalidStream("missing start position".to_string()))?;
-
-        if length < 0 {
-            return Err(Error::InvalidStream("negative stream length.".to_string()));
-        }
-
-        let length = usize::try_from(length).map_err(|e| Error::NumericCast(e.to_string()))?;
-        let end = start + length;
-
-        if end > self.buffer.len() {
-            return Err(Error::InvalidStream("stream extends after document end.".to_string()));
-        }
-
-        stream.set_content(self.buffer[start..end].to_vec());
-        Ok(())
-    }
-
-    fn get_stream_length(&self, object_id: ObjectId) -> Result<i64> {
-        let object = self.document.get_object(object_id)?;
-        let stream = object.as_stream()?;
-        stream
-            .dict
-            .get(b"Length")
-            .and_then(|value| self.document.dereference(value))
-            .and_then(|(_id, obj)| obj.as_i64())
-            .inspect_err(|_err| {
-                error!(
-                    "stream dictionary of '{} {} R' is missing the Length entry",
-                    object_id.0, object_id.1
-                );
-            })
-    }
-
-    /// Get object offset by object ID.
     fn get_offset(&self, id: ObjectId) -> Result<u32> {
         let entry = self.document.reference_table.get(id.0).ok_or(Error::MissingXrefEntry)?;
         match *entry {
@@ -1177,75 +1039,6 @@ impl Reader<'_> {
         self.parse_encryption_dictionary()?;
         self.authenticate_and_setup_encryption(true)?;
         Ok(())
-    }
-
-    fn extract_raw_object(&mut self, offset: usize) -> Result<(ObjectId, Vec<u8>)> {
-        if offset > self.buffer.len() {
-            return Err(Error::InvalidOffset(offset));
-        }
-
-        // Find object header (e.g., "19 0 obj")
-        let slice = &self.buffer[offset..];
-
-        // Parse object ID
-        let mut pos = 0;
-        while pos < slice.len() && slice[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-
-        // Get object number
-        let num_start = pos;
-        while pos < slice.len() && slice[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        let obj_num: u32 = std::str::from_utf8(&slice[num_start..pos])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(Error::Parse(ParseError::InvalidXref))?;
-
-        // Skip whitespace
-        while pos < slice.len() && slice[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-
-        // Get generation number
-        let gen_start = pos;
-        while pos < slice.len() && slice[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        let obj_gen: u16 = std::str::from_utf8(&slice[gen_start..pos])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(Error::Parse(ParseError::InvalidXref))?;
-
-        // Skip to "obj"
-        while pos < slice.len() && slice[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos + 3 > slice.len() || &slice[pos..pos + 3] != b"obj" {
-            return Err(Error::Parse(ParseError::InvalidXref));
-        }
-        pos += 3;
-
-        // Find "endobj"
-        let endobj_pattern = b"endobj";
-        let mut end_pos = pos;
-        while end_pos + endobj_pattern.len() <= slice.len() {
-            if &slice[end_pos..end_pos + endobj_pattern.len()] == endobj_pattern {
-                end_pos += endobj_pattern.len();
-                break;
-            }
-            end_pos += 1;
-        }
-
-        if end_pos > slice.len() {
-            return Err(Error::Parse(ParseError::InvalidXref));
-        }
-
-        // Extract raw object bytes (including header and trailer)
-        let raw_bytes = slice[0..end_pos].to_vec();
-
-        Ok(((obj_num, obj_gen), raw_bytes))
     }
 
     fn read_object(

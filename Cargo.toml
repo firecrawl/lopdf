@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 rust-version = "1.85"
-name = "lopdf"
+name = "lopdf-gov"
 version = "0.42.0"
 authors = [
     "Junfeng Liu <china.liujunfeng@gmail.com>",
@@ -247,6 +247,7 @@ version = "0.8.32"
 
 [dependencies.flate2]
 version = "1.0"
+features = ["zlib-rs"]
 
 [dependencies.getrandom]
 version = "0.4"
@@ -341,3 +342,6 @@ version = "0.25.1"
 
 [dev-dependencies.wasm-bindgen-test]
 version = "0.3"
+
+# Standalone package: never adopted into a parent workspace.
+[workspace]

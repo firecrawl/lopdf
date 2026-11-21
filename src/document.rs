@@ -6,6 +6,7 @@ use crate::xobject::PdfImage;
 use crate::xref::{Xref, XrefType};
 use crate::{Error, ObjectStream, Result, Stream};
 use log::debug;
+use std::borrow::Cow;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -31,8 +32,16 @@ pub struct Document {
     /// The cross-reference table contains locations of the indirect objects.
     pub reference_table: Xref,
 
-    /// The objects that make up the document contained in the file.
-    pub objects: BTreeMap<ObjectId, Object>,
+    /// The materialized objects: everything inserted by editing APIs
+    /// plus every loaded object forced to `&mut` access. Loaded
+    /// documents keep unread objects in `lazy` until first
+    /// dereference; read through `get_object`, never this map, or
+    /// unresolved objects are invisible.
+    pub(crate) objects: BTreeMap<ObjectId, Object>,
+
+    /// The lazy object store for documents loaded from bytes; `None`
+    /// on created documents and after `materialize_all`.
+    pub(crate) lazy: Option<crate::lazy::LazyStore>,
 
     /// Current maximum object id within the document.
     pub max_id: u32,
@@ -67,6 +76,7 @@ impl Document {
             trailer: Dictionary::new(),
             reference_table: Xref::new(0, XrefType::CrossReferenceStream),
             objects: BTreeMap::new(),
+            lazy: None,
             max_id: 0,
             max_bookmark_id: 0,
             bookmarks: Vec::new(),
@@ -86,6 +96,7 @@ impl Document {
             trailer: new_trailer,
             reference_table: Xref::new(0, prev.reference_table.cross_reference_type),
             objects: BTreeMap::new(),
+            lazy: None,
             max_id: prev.max_id,
             max_bookmark_id: prev.max_bookmark_id,
             bookmarks: Vec::new(),
@@ -147,7 +158,7 @@ impl Document {
 
         while let Ok(ref_id) = object.as_reference() {
             id = Some(ref_id);
-            object = self.objects.get(&ref_id).ok_or(Error::ObjectNotFound(ref_id))?;
+            object = self.raw_get(ref_id)?;
 
             nb_deref += 1;
             if nb_deref > Self::DEREF_LIMIT {
@@ -158,25 +169,150 @@ impl Document {
         Ok((id, object))
     }
 
+    /// One id lookup with no reference-following: materialized objects
+    /// win (edits shadow file state), then the lazy store resolves on
+    /// first touch. Every read goes through here.
+    fn raw_get(&self, id: ObjectId) -> Result<&Object> {
+        if let Some(object) = self.objects.get(&id) {
+            return Ok(object);
+        }
+        if let Some(lazy) = &self.lazy {
+            if let Some((generation, object)) = lazy.resolve(id.0) {
+                if *generation == id.1 {
+                    return Ok(object);
+                }
+            }
+        }
+        Err(Error::ObjectNotFound(id))
+    }
+
+    /// `raw_get` without storing a freshly parsed lazy object.
+    fn raw_get_transient(&self, id: ObjectId) -> Result<Cow<'_, Object>> {
+        if let Some(object) = self.objects.get(&id) {
+            return Ok(Cow::Borrowed(object));
+        }
+        if let Some(lazy) = &self.lazy {
+            match lazy.resolve_transient(id.0) {
+                Some(Cow::Borrowed((generation, object))) if *generation == id.1 => return Ok(Cow::Borrowed(object)),
+                Some(Cow::Owned((generation, object))) if generation == id.1 => return Ok(Cow::Owned(object)),
+                _ => {}
+            }
+        }
+        Err(Error::ObjectNotFound(id))
+    }
+
+    /// Force one object out of the lazy store into the materialized
+    /// map (for `&mut` access). The lazy entry is purged so later
+    /// reads cannot re-parse the file's version behind the
+    /// materialized one.
+    fn materialize(&mut self, id: ObjectId) -> Result<()> {
+        if self.objects.contains_key(&id) {
+            return Ok(());
+        }
+        let Some(lazy) = &self.lazy else {
+            return Err(Error::ObjectNotFound(id));
+        };
+        if lazy.resolve(id.0).is_none() {
+            return Err(Error::ObjectNotFound(id));
+        }
+        let lazy = self.lazy.as_mut().expect("lazy store checked above");
+        let Some((generation, object)) = lazy.take(id.0) else {
+            return Err(Error::ObjectNotFound(id));
+        };
+        if generation != id.1 {
+            // Wrong generation requested: put the parsed object back.
+            let stored = lazy.take(id.0);
+            debug_assert!(stored.is_none());
+            lazy.purge(id.0);
+            self.objects.insert((id.0, generation), object);
+            return Err(Error::ObjectNotFound(id));
+        }
+        lazy.purge(id.0);
+        self.objects.insert((id.0, generation), object);
+        Ok(())
+    }
+
+    /// Resolve and move EVERY remaining lazy object into the
+    /// materialized map, dropping the lazy store. Whole-document
+    /// operations (save, renumber, compression passes) call this
+    /// first; per-entry parse failures are logged and skipped, so a
+    /// document with corrupt orphan objects still saves.
+    pub fn materialize_all(&mut self) {
+        let Some(lazy) = &self.lazy else { return };
+        for id in lazy.entry_ids().collect::<Vec<u32>>() {
+            let _ = lazy.resolve(id);
+        }
+        let lazy = self.lazy.take().expect("lazy store checked above");
+        for (id, generation, object) in lazy.into_resolved() {
+            self.objects.entry((id, generation)).or_insert(object);
+        }
+    }
+
+    /// Remove one id from BOTH stores; the id afterwards reads as
+    /// absent (a lazy entry left behind would resurrect the deleted
+    /// object from the file bytes on the next read).
+    pub(crate) fn remove_object_everywhere(&mut self, id: ObjectId) -> Option<Object> {
+        let removed = self.objects.remove(&id);
+        if let Some(lazy) = self.lazy.as_mut() {
+            lazy.purge(id.0);
+        }
+        removed
+    }
+
+    /// Objects reachable through reads: materialized plus unresolved
+    /// lazy entries. An upper bound when an id is both edited and
+    /// still carried by the lazy store; used for iteration budgets.
+    pub fn object_count(&self) -> usize {
+        self.objects.len() + self.lazy.as_ref().map_or(0, |lazy| lazy.entry_count())
+    }
+
+    /// The materialized objects only. Loaded-but-unread objects are
+    /// NOT visible here; call `materialize_all` first for a
+    /// whole-document view.
+    pub fn iter_objects(&self) -> impl Iterator<Item = (&ObjectId, &Object)> {
+        self.objects.iter()
+    }
+
     /// Get object by object id, will iteratively dereference a referenced object.
     pub fn get_object(&self, id: ObjectId) -> Result<&Object> {
-        let object = self.objects.get(&id).ok_or(Error::ObjectNotFound(id))?;
+        let object = self.raw_get(id)?;
         self.dereference(object).map(|(_, object)| object)
+    }
+
+    /// Like `get_object`, but an object the lazy store has not resolved yet is
+    /// parsed into a copy the document does not keep; materialized and already
+    /// resolved objects are borrowed. For single-pass walks over large object
+    /// graphs (a structure tree), whose visited objects would otherwise all
+    /// stay resident for the document's life.
+    pub fn get_object_transient(&self, id: ObjectId) -> Result<Cow<'_, Object>> {
+        let mut object = self.raw_get_transient(id)?;
+        let mut nb_deref = 0;
+        while let Ok(ref_id) = object.as_reference() {
+            object = self.raw_get_transient(ref_id)?;
+            nb_deref += 1;
+            if nb_deref > Self::DEREF_LIMIT {
+                return Err(Error::ReferenceLimit);
+            }
+        }
+        Ok(object)
     }
 
     /// Determines if an object exists in the current document (or incremental update.)
     /// with the given `ObjectId`.
     /// `true` if the object exists, `false` if it does not exist.
     pub fn has_object(&self, id: ObjectId) -> bool {
-        self.objects.contains_key(&id)
+        self.raw_get(id).is_ok()
     }
 
     /// Get mutable reference to object by object ID, will iteratively dereference a referenced object.
     pub fn get_object_mut(&mut self, id: ObjectId) -> Result<&mut Object> {
+        self.materialize(id)?;
         let object = self.objects.get(&id).ok_or(Error::ObjectNotFound(id))?;
         let (ref_id, _obj) = self.dereference(object)?;
 
-        Ok(self.objects.get_mut(&ref_id.unwrap_or(id)).unwrap())
+        let target = ref_id.unwrap_or(id);
+        self.materialize(target)?;
+        Ok(self.objects.get_mut(&target).expect("materialized above"))
     }
 
     /// Get the object ID of the page that contains `id`.
@@ -241,6 +377,7 @@ impl Document {
                 _ => {}
             }
         }
+        self.materialize_all();
         let mut refs = vec![];
         traverse_dictionary(&mut self.trailer, &action, &mut refs);
         let mut index = 0;
@@ -421,6 +558,7 @@ impl Document {
 
         let encrypted = state.encode()?;
 
+        self.materialize_all();
         for (&id, obj) in self.objects.iter_mut() {
             encryption::encrypt_object(state, id, obj)?;
         }
@@ -460,6 +598,7 @@ impl Document {
 
         let state = EncryptionState::decode(&*self, password)?;
 
+        self.materialize_all();
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
             if id == encryption_obj_id {
@@ -496,7 +635,7 @@ impl Document {
         }
 
         let object_id = self.trailer.remove(b"Encrypt").unwrap().as_reference()?;
-        self.objects.remove(&object_id);
+        self.remove_object_everywhere(object_id);
 
         self.encryption_state = Some(state);
 
@@ -539,7 +678,7 @@ impl Document {
             if let Ok(mut contents) = page.get(b"Contents") {
                 loop {
                     match contents {
-                        Object::Reference(id) => match self.objects.get(id) {
+                        Object::Reference(id) => match self.raw_get(*id).ok() {
                             None | Some(Object::Stream(_)) => {
                                 streams.push(*id);
                             }
@@ -591,7 +730,10 @@ impl Document {
         let content_streams = self.get_page_contents(page_id);
         for object_id in content_streams {
             if let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) {
-                match content_stream.decompressed_content() {
+                match content_stream.decompressed_content_cow() {
+                    // The first stream's decoded buffer becomes the result
+                    // instead of being copied into an empty one.
+                    Ok(data) if content.is_empty() => content = data.into_owned(),
                     Ok(data) => content.write_all(&data)?,
                     Err(_) => content.write_all(&content_stream.content)?,
                 };
@@ -796,14 +938,14 @@ impl<'a> PageTreeIter<'a> {
                 doc,
                 kids: Self::kids(doc, page_tree_id),
                 stack: Vec::with_capacity(32),
-                iter_limit: doc.objects.len(),
+                iter_limit: doc.object_count(),
             }
         } else {
             Self {
                 doc,
                 kids: None,
                 stack: Vec::new(),
-                iter_limit: doc.objects.len(),
+                iter_limit: doc.object_count(),
             }
         }
     }

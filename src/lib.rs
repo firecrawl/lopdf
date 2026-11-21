@@ -26,6 +26,7 @@ mod processor;
 mod toc;
 mod writer;
 
+mod lazy;
 mod load_options;
 mod object_stream;
 mod parser;

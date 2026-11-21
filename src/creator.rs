@@ -32,7 +32,7 @@ impl Document {
     /// Other objects may still hold references to this object! Therefore, removing the object might
     /// lead to dangling references.
     pub fn remove_object(&mut self, object_id: &ObjectId) -> Result<()> {
-        self.objects.remove(object_id);
+        self.remove_object_everywhere(*object_id);
         Ok(())
     }
 
